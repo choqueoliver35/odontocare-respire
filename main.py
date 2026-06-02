@@ -14,8 +14,8 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_UPLOAD_MB', '35')) * 1024 * 1024
 app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-cambiar')
 
-ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin@odontocare.edu.bo')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
+ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'supervisor@odontocare.edu.bo')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'Respire.2026')
 
 # Ollama / DeepSeek
 USE_OLLAMA = os.getenv('USE_OLLAMA', '0') == '1'
@@ -132,44 +132,15 @@ def init_db():
         cols=[r[1] for r in c.execute('PRAGMA table_info(messages)').fetchall()]
         if 'model_used' not in cols:
             c.execute("ALTER TABLE messages ADD COLUMN model_used TEXT DEFAULT 'interno'")
-        if not c.execute('SELECT id FROM users WHERE correo=?',(ADMIN_EMAIL,)).fetchone():
+        # Sincroniza el administrador con las credenciales configuradas (código o variables de entorno).
+        # Migra automáticamente cualquier admin previo y mantiene una única cuenta de supervisor.
+        admin=c.execute("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+        if admin:
+            c.execute('UPDATE users SET nombre=?,correo=?,password_hash=? WHERE id=?',('Administrador',ADMIN_EMAIL,generate_password_hash(ADMIN_PASSWORD),admin['id']))
+        else:
             c.execute('INSERT INTO users(nombre,correo,password_hash,role,created_at) VALUES(?,?,?,?,?)',('Administrador',ADMIN_EMAIL,generate_password_hash(ADMIN_PASSWORD),'admin',now()))
         if not c.execute('SELECT id FROM users WHERE correo=?',('demo@odontocare.edu.bo',)).fetchone():
             c.execute('INSERT INTO users(nombre,correo,password_hash,role,created_at) VALUES(?,?,?,?,?)',('Estudiante Demo','demo@odontocare.edu.bo',generate_password_hash('demo123'),'estudiante',now()))
-        c.commit()
-    seed_demo()
-
-def seed_demo():
-    with conn() as c:
-        if c.execute('SELECT COUNT(*) n FROM messages').fetchone()['n'] >= 80:
-            return
-        students = [('Ana Vargas','ana@demo.edu'),('Diego Rojas','diego@demo.edu'),('Camila Flores','camila@demo.edu'),('Marco Salazar','marco@demo.edu'),('Lucía Pérez','lucia@demo.edu'),('Sofía Terán','sofia@demo.edu')]
-        user_ids=[]
-        for n,e in students:
-            row=c.execute('SELECT id FROM users WHERE correo=?',(e,)).fetchone()
-            if not row:
-                cur=c.execute('INSERT INTO users(nombre,correo,password_hash,role,created_at) VALUES(?,?,?,?,?)',(n,e,generate_password_hash('demo123'),'estudiante',now()))
-                user_ids.append(cur.lastrowid)
-            else: user_ids.append(row['id'])
-        levels = ['Sin alerta']*30 + ['Nivel 1']*20 + ['Nivel 2']*40 + ['Nivel 3']*10
-        topics = list(TOPICS.keys())
-        today = datetime(2026,5,13,14,0,0)
-        random.seed(21)
-        for i in range(110):
-            uid=random.choice(user_ids)
-            dt=today - timedelta(days=random.randint(0,27), hours=random.randint(0,8), minutes=random.randint(0,59))
-            topic=random.choice(topics)
-            level=random.choice(levels)
-            score={'Sin alerta':0,'Nivel 1':30,'Nivel 2':65,'Nivel 3':95}[level]
-            title=f"Consulta {TOPICS[topic]['label'][:22]}"
-            cur=c.execute('INSERT INTO threads(user_id,title,created_at,updated_at) VALUES(?,?,?,?)',(uid,title,dt.strftime('%Y-%m-%d %H:%M:%S'),dt.strftime('%Y-%m-%d %H:%M:%S')))
-            msg=random.choice(['Necesito repasar este tema','Estoy nervioso con este caso','No sé cómo responder esta pregunta','Quiero estudiar para clínica','Tengo dudas sobre el diagnóstico'])
-            resp=f"Respuesta académica demo sobre {TOPICS[topic]['label']}"
-            c.execute('INSERT INTO messages(thread_id,user_id,user_message,bot_response,stress_level,stress_score,topic_key,topic_label,reframe,out_domain,model_used,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(cur.lastrowid,uid,msg,resp,level,score,topic,TOPICS[topic]['label'],1 if random.random()<.28 else 0,1 if random.random()<.04 else 0,'demo',dt.strftime('%Y-%m-%d %H:%M:%S')))
-            if level in ['Nivel 2','Nivel 3'] and random.random()<.38:
-                c.execute('INSERT INTO breathing(user_id,thread_id,stress_level,completed,created_at) VALUES(?,?,?,?,?)',(uid,cur.lastrowid,level,1,dt.strftime('%Y-%m-%d %H:%M:%S')))
-            if level == 'Nivel 3' and random.random()<.72:
-                c.execute('INSERT INTO recovery(user_id,thread_id,status,created_at) VALUES(?,?,?,?)',(uid,cur.lastrowid,'recuperado',dt.strftime('%Y-%m-%d %H:%M:%S')))
         c.commit()
 
 def login_required(fn):
@@ -660,6 +631,18 @@ def dashboard():
         recent=[dict(r) for r in c.execute(f'SELECT u.nombre,m.user_message,m.stress_level,m.topic_label,m.model_used,m.created_at FROM messages m JOIN users u ON u.id=m.user_id {where} ORDER BY m.created_at DESC LIMIT 10',params).fetchall()]
     kpis={'mensajes':total,'sesiones_sin_estres':sin,'tasa_recuperacion':round((rec/max(1,crit))*100),'reencuadre_activo':round((refr/max(1,total))*100),'anclajes_respiratorios':anch,'fuera_dominio':fuera}
     return jsonify(ok=True,kpis=kpis,levels=levels,activity=activity,topics=topics,students=students,recent=recent)
+
+@app.route('/api/admin/users')
+@login_required
+@admin_required
+def admin_users():
+    with conn() as c:
+        sql = ("SELECT u.id,u.nombre,u.correo,u.role,u.created_at,"
+               "COUNT(m.id) mensajes, MAX(m.created_at) ultima_actividad "
+               "FROM users u LEFT JOIN messages m ON m.user_id=u.id "
+               "GROUP BY u.id ORDER BY u.role DESC, u.nombre")
+        users=[dict(r) for r in c.execute(sql).fetchall()]
+    return jsonify(ok=True,users=users)
 
 @app.route('/api/documents')
 @login_required
